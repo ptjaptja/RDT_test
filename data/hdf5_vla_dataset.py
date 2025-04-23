@@ -18,29 +18,35 @@ class HDF5VLADataset:
     def __init__(self) -> None:
         # [Modify] The path to the HDF5 dataset directory
         # Each HDF5 file contains one episode
-        HDF5_DIR = "data/datasets/agilex/rdt_data/"
-        self.DATASET_NAME = "agilex"
-        
+        HDF5_DIR = "data/datasets/pickneedle/"
+        self.DATASET_NAME = "pickneedle"
+        #递归扫出 HDF5_DIR 下所有后缀为 .hdf5 的文件，并将所有hdf5的全局地址填到file_paths中"
         self.file_paths = []
         for root, _, files in os.walk(HDF5_DIR):
             for filename in fnmatch.filter(files, '*.hdf5'):
                 file_path = os.path.join(root, filename)
                 self.file_paths.append(file_path)
+        
+        # 遍历目录下的所有文件，筛选出以 .pt 结尾的文件
+        instruct_path=os.path.join(HDF5_DIR,'instruct')
+        self.instruct_files = [os.path.join(instruct_path, f) for f in os.listdir(instruct_path) if f.endswith(".pt")]
                 
-        # Load the config
+        # Load the config,statedim不用改了必定时128，chunksize可根据任务需要进行修改，图片历史默认为2（太长感觉在这个模型里没用且耗内存）
         with open('configs/base.yaml', 'r') as file:
             config = yaml.safe_load(file)
         self.CHUNK_SIZE = config['common']['action_chunk_size']
         self.IMG_HISORY_SIZE = config['common']['img_history_size']
         self.STATE_DIM = config['common']['state_dim']
     
-        # Get each episode's len
+        # Get each episode's len，计算每个hdf5中任务的长度，用每条轨迹的时间步数决定它被采样的概率，长的轨迹更容易被抽中
         episode_lens = []
         for file_path in self.file_paths:
             valid, res = self.parse_hdf5_file_state_only(file_path)
             _len = res['state'].shape[0] if valid else 0
             episode_lens.append(_len)
         self.episode_sample_weights = np.array(episode_lens) / np.sum(episode_lens)
+    
+    
     
     def __len__(self):
         return len(self.file_paths)
@@ -132,20 +138,26 @@ class HDF5VLADataset:
             # We randomly sample a timestep
             step_id = np.random.randint(first_idx-1, num_steps)
             
-            # Load the instruction
-            dir_path = os.path.dirname(file_path)
-            with open(os.path.join(dir_path, 'expanded_instruction_gpt-4-turbo.json'), 'r') as f_instr:
-                instruction_dict = json.load(f_instr)
-            # We have 1/3 prob to use original instruction,
-            # 1/3 to use simplified instruction,
-            # and 1/3 to use expanded instruction.
-            instruction_type = np.random.choice([
-                'instruction', 'simplified_instruction', 'expanded_instruction'])
-            instruction = instruction_dict[instruction_type]
-            if isinstance(instruction, list):
-                instruction = np.random.choice(instruction)
+            # # Load the instruction
+            # dir_path = os.path.dirname(file_path) #获得这个hdf5文件上一层级的文件路径名（即hdf5所在的文件夹路径名）
+            # with open(os.path.join(dir_path, 'expanded_instruction_gpt-4-turbo.json'), 'r') as f_instr:
+            #     instruction_dict = json.load(f_instr)
+            # # We have 1/3 prob to use original instruction,
+            # # 1/3 to use simplified instruction,
+            # # and 1/3 to use expanded instruction.
+            # instruction_type = np.random.choice([
+            #     'instruction', 'simplified_instruction', 'expanded_instruction'])
+            # instruction = instruction_dict[instruction_type]
+            # if isinstance(instruction, list):
+            #     instruction = np.random.choice(instruction)
             # You can also use precomputed language embeddings (recommended)
             # instruction = "path/to/lang_embed.pt"
+            #此处直接指明之前处理过的语言编码路径，即事先用T5模型处理好的pt文件（上述代码可以删掉）
+            #采用预处理文本的方法，即在hdf5的同级有个instruct文件夹，其中有多个已经编码的pt文件（都是描述相同任务的），随机从中抽一个pt文件
+
+            if isinstance(self.instruct_files, list):
+                instruction = np.random.choice(self.instruct_files)
+            
             
             # Assemble the meta
             meta = {
@@ -155,12 +167,12 @@ class HDF5VLADataset:
                 "instruction": instruction
             }
             
-            # Rescale gripper to [0, 1]
+            # Rescale 此处根据输入的维度进行调整，先不进行归一化。此处为单臂的xyz+6D+开合
             qpos = qpos / np.array(
-               [[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]] 
+               [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] 
             )
             target_qpos = f['action'][step_id:step_id+self.CHUNK_SIZE] / np.array(
-               [[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]] 
+               [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] 
             )
             
             # Parse the state and action
@@ -179,14 +191,8 @@ class HDF5VLADataset:
             # Fill the state/action into the unified vector
             def fill_in_state(values):
                 # Target indices corresponding to your state space
-                # In this example: 6 joints + 1 gripper for each arm
-                UNI_STATE_INDICES = [
-                    STATE_VEC_IDX_MAPPING[f"left_arm_joint_{i}_pos"] for i in range(6)
-                ] + [
-                    STATE_VEC_IDX_MAPPING["left_gripper_open"]
-                ] + [
-                    STATE_VEC_IDX_MAPPING[f"right_arm_joint_{i}_pos"] for i in range(6)
-                ] + [
+                # In this example: 6 joints + 1 gripper for each arm。此处改为右臂的xyz+6D表示+开合
+                UNI_STATE_INDICES = [STATE_VEC_IDX_MAPPING["right_eef_pos_x"]]+[31] +[32]+[STATE_VEC_IDX_MAPPING["right_eef_angle_0"]]+[34]+[35]+ [36]+[37]+[38]+[
                     STATE_VEC_IDX_MAPPING["right_gripper_open"]
                 ]
                 uni_vec = np.zeros(values.shape[:-1] + (self.STATE_DIM,))
@@ -281,10 +287,10 @@ class HDF5VLADataset:
             
             # Rescale gripper to [0, 1]
             qpos = qpos / np.array(
-               [[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]] 
+               [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] 
             )
             target_qpos = f['action'][:] / np.array(
-               [[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]] 
+               [[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]] 
             )
             
             # Parse the state and action
@@ -294,14 +300,8 @@ class HDF5VLADataset:
             # Fill the state/action into the unified vector
             def fill_in_state(values):
                 # Target indices corresponding to your state space
-                # In this example: 6 joints + 1 gripper for each arm
-                UNI_STATE_INDICES = [
-                    STATE_VEC_IDX_MAPPING[f"left_arm_joint_{i}_pos"] for i in range(6)
-                ] + [
-                    STATE_VEC_IDX_MAPPING["left_gripper_open"]
-                ] + [
-                    STATE_VEC_IDX_MAPPING[f"right_arm_joint_{i}_pos"] for i in range(6)
-                ] + [
+                # In this example: 6 joints + 1 gripper for each arm。此处改为右臂的xyz+6D表示+开合
+                UNI_STATE_INDICES = [STATE_VEC_IDX_MAPPING["right_eef_pos_x"]]+[31] +[32]+[STATE_VEC_IDX_MAPPING["right_eef_angle_0"]]+[34]+[35]+ [36]+[37]+[38]+[
                     STATE_VEC_IDX_MAPPING["right_gripper_open"]
                 ]
                 uni_vec = np.zeros(values.shape[:-1] + (self.STATE_DIM,))
